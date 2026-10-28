@@ -9,8 +9,16 @@ Tools provided:
   - scan_disk: Scan for deletable caches
   - explain_cache: Explain what a cache type is
   - ask_cleanup: Ask questions about disk cleanup
-  - delete_caches: Delete selected cache types
+  - delete_caches: Delete or archive selected cache types
   - get_disk_usage: Get current disk usage
+  - list_cache_types: List all known cache types
+  - get_config: Show current configuration
+
+Configuration:
+  Reads .env files from:
+  1. <repo>/.env
+  2. ~/.cleanup-dev-caches.env
+  3. ~/.config/free-space-available/.env
 
 To run:
     python -m mcp.server
@@ -32,7 +40,9 @@ import sys
 import json
 import subprocess
 import shutil
+import tarfile
 from pathlib import Path
+from datetime import datetime
 from typing import Optional, List, Dict, Any
 
 # Add src to path
@@ -43,12 +53,58 @@ from mcp.server.models import InitializationOptions
 from mcp.types import Tool, TextContent, Resource, ResourceTemplate
 import mcp.server.stdio
 
-from corey_integration import CoreyCleanupAdvisor, SafetyLevel, CACHE_KNOWLEDGE
+from corey_integration import (
+    CoreyCleanupAdvisor, SafetyLevel, CACHE_KNOWLEDGE,
+    load_env_file, ARCHIVE_MODE, ARCHIVE_DIR
+)
 
+
+# Load configuration from .env
+_config = load_env_file()
+
+# Configuration with defaults
+CONFIG = {
+    "SCAN_PATHS": _config.get("SCAN_PATHS", "~/Documents/github,~"),
+    "MIN_SIZE_KB": int(_config.get("MIN_SIZE_KB", "100")),
+    "MIN_AGE_DAYS": int(_config.get("MIN_AGE_DAYS", "0")),
+    "ARCHIVE_MODE": _config.get("ARCHIVE_MODE", "false").lower() == "true",
+    "ARCHIVE_DIR": _config.get("ARCHIVE_DIR", str(Path.home() / ".cleanup-archive")),
+    "ARCHIVE_COMPRESS": _config.get("ARCHIVE_COMPRESS", "true").lower() == "true",
+}
 
 # Initialize MCP server
 server = Server("free-space-available")
 advisor = CoreyCleanupAdvisor()
+
+
+def archive_directory(dir_path: str) -> str:
+    """Archive a directory instead of deleting it."""
+    archive_base = Path(CONFIG["ARCHIVE_DIR"]).expanduser()
+    archive_base.mkdir(parents=True, exist_ok=True)
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    basename = Path(dir_path).name
+
+    if CONFIG["ARCHIVE_COMPRESS"]:
+        archive_file = archive_base / f"{timestamp}_{basename}.tar.gz"
+        with tarfile.open(archive_file, "w:gz") as tar:
+            tar.add(dir_path, arcname=basename)
+        shutil.rmtree(dir_path)
+        return str(archive_file)
+    else:
+        archive_dest = archive_base / f"{timestamp}_{basename}"
+        shutil.move(dir_path, archive_dest)
+        return str(archive_dest)
+
+
+def get_file_age_days(path: str) -> int:
+    """Get age of a file/directory in days."""
+    try:
+        mtime = os.path.getmtime(path)
+        age_seconds = datetime.now().timestamp() - mtime
+        return int(age_seconds / 86400)
+    except:
+        return 0
 
 
 @server.list_tools()
@@ -68,6 +124,10 @@ async def list_tools() -> List[Tool]:
                     "include_system": {
                         "type": "boolean",
                         "description": "Include system-level caches like npm, pip, Xcode (default: true)"
+                    },
+                    "min_age_days": {
+                        "type": "integer",
+                        "description": "Only include files older than N days (default: from config)"
                     }
                 }
             }
@@ -102,7 +162,7 @@ async def list_tools() -> List[Tool]:
         ),
         Tool(
             name="delete_caches",
-            description="Delete specific cache types. Use with caution - verify safety level first.",
+            description="Delete or archive specific cache types. Supports archive mode to move files instead of permanent deletion.",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -117,7 +177,11 @@ async def list_tools() -> List[Tool]:
                     },
                     "dry_run": {
                         "type": "boolean",
-                        "description": "If true, only show what would be deleted"
+                        "description": "If true, only show what would be deleted/archived"
+                    },
+                    "archive": {
+                        "type": "boolean",
+                        "description": "If true, archive instead of delete (default: from config)"
                     }
                 },
                 "required": ["cache_types"]
@@ -143,6 +207,14 @@ async def list_tools() -> List[Tool]:
                 "type": "object",
                 "properties": {}
             }
+        ),
+        Tool(
+            name="get_config",
+            description="Show current configuration from .env file.",
+            inputSchema={
+                "type": "object",
+                "properties": {}
+            }
         )
     ]
 
@@ -154,7 +226,8 @@ async def call_tool(name: str, arguments: Dict[str, Any]) -> List[TextContent]:
     if name == "scan_disk":
         return await scan_disk(
             arguments.get("path", os.path.expanduser("~/Documents/github")),
-            arguments.get("include_system", True)
+            arguments.get("include_system", True),
+            arguments.get("min_age_days", CONFIG["MIN_AGE_DAYS"])
         )
 
     elif name == "explain_cache":
@@ -167,7 +240,8 @@ async def call_tool(name: str, arguments: Dict[str, Any]) -> List[TextContent]:
         return await delete_caches(
             arguments["cache_types"],
             arguments.get("path", os.path.expanduser("~/Documents/github")),
-            arguments.get("dry_run", False)
+            arguments.get("dry_run", False),
+            arguments.get("archive", CONFIG["ARCHIVE_MODE"])
         )
 
     elif name == "get_disk_usage":
@@ -178,25 +252,38 @@ async def call_tool(name: str, arguments: Dict[str, Any]) -> List[TextContent]:
     elif name == "list_cache_types":
         return await list_cache_types()
 
+    elif name == "get_config":
+        return await get_config()
+
     else:
         return [TextContent(type="text", text=f"Unknown tool: {name}")]
 
 
-async def scan_disk(path: str, include_system: bool) -> List[TextContent]:
+async def scan_disk(path: str, include_system: bool, min_age_days: int) -> List[TextContent]:
     """Scan for deletable caches."""
     results = []
     total_size = 0
 
     path = os.path.expanduser(path)
+    min_size_kb = CONFIG["MIN_SIZE_KB"]
 
     # Patterns to scan for
     patterns = [
         ("node_modules", "node_modules", SafetyLevel.SAFE),
         (".next", ".next", SafetyLevel.SAFE),
+        (".nuxt", ".nuxt", SafetyLevel.SAFE),
+        (".vite", ".vite", SafetyLevel.SAFE),
+        (".turbo", ".turbo", SafetyLevel.SAFE),
+        (".parcel-cache", ".parcel-cache", SafetyLevel.SAFE),
         ("__pycache__", "__pycache__", SafetyLevel.SAFE),
+        (".pytest_cache", ".pytest_cache", SafetyLevel.SAFE),
+        (".mypy_cache", ".mypy_cache", SafetyLevel.SAFE),
         ("Pods", "Pods", SafetyLevel.SAFE),
         (".gradle", ".gradle", SafetyLevel.SAFE),
         ("target", "target", SafetyLevel.SAFE),
+        (".cxx", ".cxx", SafetyLevel.SAFE),
+        ("bin", "bin", SafetyLevel.SAFE),
+        ("obj", "obj", SafetyLevel.SAFE),
         (".venv", ".venv", SafetyLevel.REVIEW),
         ("venv", "venv", SafetyLevel.REVIEW),
     ]
@@ -209,18 +296,25 @@ async def scan_disk(path: str, include_system: bool) -> List[TextContent]:
             )
             for dir_path in result.stdout.strip().split("\n"):
                 if dir_path and os.path.isdir(dir_path):
+                    # Check age filter
+                    if min_age_days > 0:
+                        age = get_file_age_days(dir_path)
+                        if age < min_age_days:
+                            continue
+
                     try:
                         size = subprocess.run(
                             ["du", "-sk", dir_path],
                             capture_output=True, text=True, timeout=30
                         )
                         size_kb = int(size.stdout.split()[0])
-                        if size_kb > 100:  # Skip tiny dirs
+                        if size_kb > min_size_kb:
                             results.append({
                                 "type": name,
                                 "path": dir_path,
                                 "size_kb": size_kb,
-                                "safety": safety.name
+                                "safety": safety.name,
+                                "age_days": get_file_age_days(dir_path)
                             })
                             total_size += size_kb
                     except:
@@ -232,25 +326,38 @@ async def scan_disk(path: str, include_system: bool) -> List[TextContent]:
     if include_system:
         system_dirs = [
             ("npm cache", os.path.expanduser("~/.npm"), SafetyLevel.SAFE),
+            ("yarn cache", os.path.expanduser("~/.yarn/cache"), SafetyLevel.SAFE),
             ("pip cache", os.path.expanduser("~/Library/Caches/pip"), SafetyLevel.SAFE),
+            ("pip cache", os.path.expanduser("~/.cache/pip"), SafetyLevel.SAFE),
             ("Xcode DerivedData", os.path.expanduser("~/Library/Developer/Xcode/DerivedData"), SafetyLevel.SAFE),
             ("Homebrew cache", os.path.expanduser("~/Library/Caches/Homebrew"), SafetyLevel.SAFE),
+            ("CocoaPods cache", os.path.expanduser("~/Library/Caches/CocoaPods"), SafetyLevel.SAFE),
+            ("Cargo registry", os.path.expanduser("~/.cargo/registry"), SafetyLevel.SAFE),
+            ("Go modules", os.path.expanduser("~/go/pkg/mod"), SafetyLevel.SAFE),
+            ("Gradle cache", os.path.expanduser("~/.gradle/caches"), SafetyLevel.SAFE),
         ]
 
         for name, dir_path, safety in system_dirs:
             if os.path.isdir(dir_path):
+                # Check age filter
+                if min_age_days > 0:
+                    age = get_file_age_days(dir_path)
+                    if age < min_age_days:
+                        continue
+
                 try:
                     size = subprocess.run(
                         ["du", "-sk", dir_path],
                         capture_output=True, text=True, timeout=30
                     )
                     size_kb = int(size.stdout.split()[0])
-                    if size_kb > 100:
+                    if size_kb > min_size_kb:
                         results.append({
                             "type": name,
                             "path": dir_path,
                             "size_kb": size_kb,
-                            "safety": safety.name
+                            "safety": safety.name,
+                            "age_days": get_file_age_days(dir_path)
                         })
                         total_size += size_kb
                 except:
@@ -258,7 +365,10 @@ async def scan_disk(path: str, include_system: bool) -> List[TextContent]:
 
     # Format output
     output = f"# Scan Results\n\n"
-    output += f"**Total reclaimable:** {total_size / 1024:.1f} MB\n\n"
+    output += f"**Total reclaimable:** {total_size / 1024:.1f} MB\n"
+    if min_age_days > 0:
+        output += f"**Filter:** Only items older than {min_age_days} days\n"
+    output += f"**Mode:** {'Archive' if CONFIG['ARCHIVE_MODE'] else 'Delete'}\n\n"
 
     # Group by safety
     safe = [r for r in results if r["safety"] == "SAFE"]
@@ -269,21 +379,21 @@ async def scan_disk(path: str, include_system: bool) -> List[TextContent]:
         safe_total = sum(r["size_kb"] for r in safe) / 1024
         output += f"## SAFE to delete ({safe_total:.1f} MB)\n"
         for r in sorted(safe, key=lambda x: -x["size_kb"])[:10]:
-            output += f"- {r['type']}: {r['size_kb']/1024:.1f} MB\n"
+            output += f"- {r['type']}: {r['size_kb']/1024:.1f} MB ({r['age_days']}d old)\n"
         output += "\n"
 
     if caution:
         caution_total = sum(r["size_kb"] for r in caution) / 1024
         output += f"## CAUTION ({caution_total:.1f} MB)\n"
         for r in sorted(caution, key=lambda x: -x["size_kb"])[:5]:
-            output += f"- {r['type']}: {r['size_kb']/1024:.1f} MB\n"
+            output += f"- {r['type']}: {r['size_kb']/1024:.1f} MB ({r['age_days']}d old)\n"
         output += "\n"
 
     if review:
         review_total = sum(r["size_kb"] for r in review) / 1024
         output += f"## REVIEW before deleting ({review_total:.1f} MB)\n"
         for r in sorted(review, key=lambda x: -x["size_kb"])[:5]:
-            output += f"- {r['type']}: {r['size_kb']/1024:.1f} MB\n"
+            output += f"- {r['type']}: {r['size_kb']/1024:.1f} MB ({r['age_days']}d old)\n"
 
     return [TextContent(type="text", text=output)]
 
@@ -303,12 +413,14 @@ async def ask_cleanup(question: str) -> List[TextContent]:
 async def delete_caches(
     cache_types: List[str],
     path: str,
-    dry_run: bool
+    dry_run: bool,
+    archive: bool
 ) -> List[TextContent]:
-    """Delete specified cache types."""
+    """Delete or archive specified cache types."""
     path = os.path.expanduser(path)
-    deleted = []
+    results = []
     total_freed = 0
+    action = "archive" if archive else "delete"
 
     for cache_type in cache_types:
         # Find directories matching this type
@@ -327,23 +439,31 @@ async def delete_caches(
                         size_kb = int(size.stdout.split()[0])
 
                         if dry_run:
-                            deleted.append(f"Would delete: {dir_path} ({size_kb/1024:.1f} MB)")
+                            results.append(f"Would {action}: {dir_path} ({size_kb/1024:.1f} MB)")
                         else:
-                            shutil.rmtree(dir_path)
-                            deleted.append(f"Deleted: {dir_path} ({size_kb/1024:.1f} MB)")
+                            if archive:
+                                archive_dest = archive_directory(dir_path)
+                                results.append(f"Archived: {dir_path} -> {archive_dest} ({size_kb/1024:.1f} MB)")
+                            else:
+                                shutil.rmtree(dir_path)
+                                results.append(f"Deleted: {dir_path} ({size_kb/1024:.1f} MB)")
 
                         total_freed += size_kb
                     except Exception as e:
-                        deleted.append(f"Error with {dir_path}: {e}")
+                        results.append(f"Error with {dir_path}: {e}")
         except:
             pass
 
-    output = "# Deletion Results\n\n"
+    output = f"# {'Archive' if archive else 'Deletion'} Results\n\n"
     if dry_run:
-        output += "**DRY RUN - No files actually deleted**\n\n"
+        output += f"**DRY RUN - No files actually {'archived' if archive else 'deleted'}**\n\n"
 
-    output += f"**Space freed:** {total_freed/1024:.1f} MB\n\n"
-    for item in deleted:
+    output += f"**Space freed:** {total_freed/1024:.1f} MB\n"
+    if archive and not dry_run:
+        output += f"**Archive location:** {CONFIG['ARCHIVE_DIR']}\n"
+    output += "\n"
+
+    for item in results:
         output += f"- {item}\n"
 
     return [TextContent(type="text", text=output)]
@@ -399,6 +519,22 @@ async def list_cache_types() -> List[TextContent]:
     return [TextContent(type="text", text=output)]
 
 
+async def get_config() -> List[TextContent]:
+    """Show current configuration."""
+    output = "# Current Configuration\n\n"
+    output += "Settings loaded from .env file:\n\n"
+
+    for key, value in CONFIG.items():
+        output += f"- **{key}**: `{value}`\n"
+
+    output += "\n## Config file locations (first found wins):\n"
+    output += "1. `<repo>/.env`\n"
+    output += "2. `~/.cleanup-dev-caches.env`\n"
+    output += "3. `~/.config/free-space-available/.env`\n"
+
+    return [TextContent(type="text", text=output)]
+
+
 async def main():
     """Run the MCP server."""
     async with mcp.server.stdio.stdio_server() as (read_stream, write_stream):
@@ -407,7 +543,7 @@ async def main():
             write_stream,
             InitializationOptions(
                 server_name="free-space-available",
-                server_version="1.0.0",
+                server_version="1.1.0",
                 capabilities=server.get_capabilities(
                     notification_options=NotificationOptions(),
                     experimental_capabilities={}

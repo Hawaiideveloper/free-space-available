@@ -191,6 +191,23 @@ function Get-SafetyLabel {
     }
 }
 
+function Get-DirAgeDays {
+    param([string]$Path)
+    try {
+        $lastWrite = (Get-Item $Path -ErrorAction SilentlyContinue).LastWriteTime
+        return [math]::Floor(((Get-Date) - $lastWrite).TotalDays)
+    } catch {
+        return 0
+    }
+}
+
+function Test-AgeFilter {
+    param([string]$Path)
+    if ($script:Settings.MIN_AGE_DAYS -eq 0) { return $true }
+    $age = Get-DirAgeDays $Path
+    return $age -ge $script:Settings.MIN_AGE_DAYS
+}
+
 # ═══════════════════════════════════════════════════════════════════════════
 # COREY-CODER INTEGRATION
 # ═══════════════════════════════════════════════════════════════════════════
@@ -286,8 +303,10 @@ function Scan-Pattern {
 
     Get-ChildItem -Path $SearchPath -Directory -Filter $Pattern -Recurse -ErrorAction SilentlyContinue |
         ForEach-Object {
-            $sizeKB = Get-DirSizeKB $_.FullName
-            Add-Finding -Safety $Safety -Type $Description -SizeKB $sizeKB -Path $_.FullName -Description $Explanation
+            if (Test-AgeFilter $_.FullName) {
+                $sizeKB = Get-DirSizeKB $_.FullName
+                Add-Finding -Safety $Safety -Type $Description -SizeKB $sizeKB -Path $_.FullName -Description $Explanation
+            }
         }
 }
 
@@ -299,7 +318,7 @@ function Scan-Dir {
         [string]$Explanation = "Regenerates automatically"
     )
 
-    if (Test-Path $Dir) {
+    if ((Test-Path $Dir) -and (Test-AgeFilter $Dir)) {
         $sizeKB = Get-DirSizeKB $Dir
         Add-Finding -Safety $Safety -Type $Description -SizeKB $sizeKB -Path $Dir -Description $Explanation
     }
@@ -580,6 +599,7 @@ if ($Config) {
     Write-Host "  Corey Model:         $($script:Settings.COREY_MODEL)"
     Write-Host "  Safe Mode Only:      $($script:Settings.SAFE_MODE_ONLY)"
     Write-Host "  Min Size:            $($script:Settings.MIN_SIZE_KB) KB"
+    Write-Host "  Min Age:             $($script:Settings.MIN_AGE_DAYS) days"
     Write-Host ""
     Write-Host "  Config files checked:"
     Write-Host "    - $RepoDir\.env"

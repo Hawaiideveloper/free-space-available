@@ -175,6 +175,7 @@ if $SHOW_CONFIG; then
     echo "  Corey Model:       $COREY_MODEL"
     echo "  Safe Mode Only:    $SAFE_MODE_ONLY"
     echo "  Min Size:          ${MIN_SIZE_KB} KB"
+    echo "  Min Age:           ${MIN_AGE_DAYS} days"
     echo ""
     echo "  Config files checked:"
     echo "    - ${REPO_DIR}/.env"
@@ -274,6 +275,35 @@ dir_size() {
     du -sk "$1" 2>/dev/null | cut -f1 || echo 0
 }
 
+# Get age of a directory in days (based on modification time)
+dir_age_days() {
+    local dir="$1"
+    if [[ "$(uname)" == "Darwin" ]]; then
+        # macOS: use stat -f %m for mtime
+        local mtime
+        mtime=$(stat -f %m "$dir" 2>/dev/null || echo 0)
+        local now
+        now=$(date +%s)
+        echo $(( (now - mtime) / 86400 ))
+    else
+        # Linux: use stat -c %Y
+        local mtime
+        mtime=$(stat -c %Y "$dir" 2>/dev/null || echo 0)
+        local now
+        now=$(date +%s)
+        echo $(( (now - mtime) / 86400 ))
+    fi
+}
+
+# Check if directory passes age filter
+passes_age_filter() {
+    local dir="$1"
+    [[ $MIN_AGE_DAYS -eq 0 ]] && return 0
+    local age
+    age=$(dir_age_days "$dir")
+    [[ $age -ge $MIN_AGE_DAYS ]]
+}
+
 # Check if path should be excluded
 is_excluded() {
     local path="$1"
@@ -296,7 +326,7 @@ scan_pattern() {
     [[ ! -d "$search_path" ]] && return
 
     while IFS= read -r dir; do
-        if [[ -d "$dir" ]] && ! is_excluded "$dir"; then
+        if [[ -d "$dir" ]] && ! is_excluded "$dir" && passes_age_filter "$dir"; then
             local size_kb
             size_kb=$(dir_size "$dir")
             if [[ $size_kb -gt $MIN_SIZE_KB ]]; then
@@ -316,7 +346,7 @@ scan_path_pattern() {
     [[ ! -d "$search_path" ]] && return
 
     while IFS= read -r dir; do
-        if [[ -d "$dir" ]] && ! is_excluded "$dir"; then
+        if [[ -d "$dir" ]] && ! is_excluded "$dir" && passes_age_filter "$dir"; then
             local size_kb
             size_kb=$(dir_size "$dir")
             if [[ $size_kb -gt $MIN_SIZE_KB ]]; then
@@ -332,7 +362,7 @@ scan_dir() {
     local dir="$3"
     local explanation="${4:-Regenerates automatically}"
 
-    if [[ -d "$dir" ]] && ! is_excluded "$dir"; then
+    if [[ -d "$dir" ]] && ! is_excluded "$dir" && passes_age_filter "$dir"; then
         local size_kb
         size_kb=$(dir_size "$dir")
         if [[ $size_kb -gt $MIN_SIZE_KB ]]; then
