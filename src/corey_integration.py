@@ -5,6 +5,8 @@ Corey-coder integration for free-space-available.
 This module provides intelligent disk cleanup recommendations by querying
 corey-coder (our fine-tuned LLM) for context-aware decisions.
 
+Supports macOS, Linux, and Windows. Reads configuration from .env files.
+
 Usage:
     from corey_integration import CoreyCleanupAdvisor
 
@@ -18,20 +20,87 @@ Usage:
 
     # Ask a free-form question
     answer = advisor.ask("Is it safe to delete .venv folders?")
+
+Configuration:
+    Reads settings from .env files in this order:
+    1. <repo>/.env
+    2. ~/.cleanup-dev-caches.env
+    3. ~/.config/free-space-available/.env
+
+    Key settings:
+    - COREY_ENDPOINT: corey-router API endpoint
+    - COREY_MODEL: Primary model to use
+    - COREY_FALLBACK_MODEL: Fallback model
+    - AI_ENABLED: Enable/disable AI queries
+    - ARCHIVE_MODE: Archive instead of delete
+    - ARCHIVE_DIR: Where to store archives
 """
 
 import os
+import sys
 import json
 import subprocess
+from pathlib import Path
 from typing import Optional, Dict, List, Any
 from dataclasses import dataclass
 from enum import Enum
 import httpx
 
-# Configuration
-COREY_ENDPOINT = os.getenv("COREY_ENDPOINT", "http://corey-router.corey-coder.svc.cluster.local:8081")
-COREY_MODEL = os.getenv("COREY_MODEL", "corey-coder:latest")
-FALLBACK_MODEL = os.getenv("FALLBACK_MODEL", "qwen3.8:latest")
+
+def load_env_file() -> Dict[str, str]:
+    """Load configuration from .env files."""
+    config = {}
+
+    # Determine script/repo directory
+    script_dir = Path(__file__).parent
+    repo_dir = script_dir.parent
+
+    # Check multiple locations
+    env_paths = [
+        repo_dir / ".env",
+        Path.home() / ".cleanup-dev-caches.env",
+        Path.home() / ".config" / "free-space-available" / ".env",
+    ]
+
+    for env_path in env_paths:
+        if env_path.exists():
+            with open(env_path, 'r') as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith('#'):
+                        continue
+                    if '=' in line:
+                        key, value = line.split('=', 1)
+                        key = key.strip()
+                        value = value.strip().strip('"').strip("'")
+                        # Expand ~ to home directory
+                        if value.startswith('~'):
+                            value = str(Path.home()) + value[1:]
+                        config[key] = value
+            break  # Use first found
+
+    return config
+
+
+# Load configuration
+_ENV_CONFIG = load_env_file()
+
+# Configuration with .env override
+COREY_ENDPOINT = _ENV_CONFIG.get(
+    "COREY_ENDPOINT",
+    os.getenv("COREY_ENDPOINT", "http://corey-router.corey-coder.svc.cluster.local:8081")
+)
+COREY_MODEL = _ENV_CONFIG.get(
+    "COREY_MODEL",
+    os.getenv("COREY_MODEL", "corey-coder:latest")
+)
+FALLBACK_MODEL = _ENV_CONFIG.get(
+    "COREY_FALLBACK_MODEL",
+    os.getenv("COREY_FALLBACK_MODEL", "qwen3.8:latest")
+)
+AI_ENABLED = _ENV_CONFIG.get("AI_ENABLED", "true").lower() == "true"
+ARCHIVE_MODE = _ENV_CONFIG.get("ARCHIVE_MODE", "false").lower() == "true"
+ARCHIVE_DIR = _ENV_CONFIG.get("ARCHIVE_DIR", str(Path.home() / ".cleanup-archive"))
 
 
 class SafetyLevel(Enum):
@@ -130,6 +199,49 @@ CACHE_KNOWLEDGE = {
         "description": "iPhone/iPad backups",
         "regenerate": "backup device again",
         "explanation": "Mobile device backups. May be your only copy of important data. Only delete if you have iCloud backup or don't need the data."
+    },
+    # Windows-specific caches
+    "npm-cache": {
+        "safety": SafetyLevel.SAFE,
+        "description": "npm global cache (Windows)",
+        "regenerate": "automatic on install",
+        "explanation": "npm's Windows cache in AppData. Safe to delete - npm re-downloads packages as needed."
+    },
+    "NuGet": {
+        "safety": SafetyLevel.SAFE,
+        "description": "NuGet package cache",
+        "regenerate": "dotnet restore",
+        "explanation": ".NET package cache. Safe to delete - NuGet downloads packages on build/restore."
+    },
+    "VS Code cache": {
+        "safety": SafetyLevel.SAFE,
+        "description": "Visual Studio Code cache",
+        "regenerate": "automatic",
+        "explanation": "VS Code extension and runtime cache. Safe to delete - regenerates on startup."
+    },
+    "Chrome cache": {
+        "safety": SafetyLevel.CAUTION,
+        "description": "Chrome browser cache",
+        "regenerate": "automatic on browse",
+        "explanation": "Chrome's browsing cache. Usually safe, but may slow down browsing temporarily after deletion."
+    },
+    "Edge cache": {
+        "safety": SafetyLevel.CAUTION,
+        "description": "Edge browser cache",
+        "regenerate": "automatic on browse",
+        "explanation": "Edge's browsing cache. Usually safe, but may slow down browsing temporarily after deletion."
+    },
+    "Windows Temp": {
+        "safety": SafetyLevel.CAUTION,
+        "description": "Windows temporary files",
+        "regenerate": "automatic",
+        "explanation": "System and app temp files. Usually safe but some apps may be using them. Close apps first."
+    },
+    "Recycle Bin": {
+        "safety": SafetyLevel.REVIEW,
+        "description": "Windows Recycle Bin",
+        "regenerate": "not possible",
+        "explanation": "Deleted files waiting for permanent removal. Review before emptying - this is your last chance to recover them."
     }
 }
 
@@ -169,8 +281,12 @@ class CoreyCleanupAdvisor:
     ) -> Optional[str]:
         """Query corey-coder via corey-router."""
 
+        # Check if AI is enabled
+        if not AI_ENABLED:
+            return None
+
         if system_prompt is None:
-            system_prompt = """You are a disk cleanup expert for macOS and Linux development machines.
+            system_prompt = """You are a disk cleanup expert for macOS, Linux, and Windows development machines.
 You help users understand what files and caches are safe to delete.
 Be concise, direct, and technically accurate.
 Always mention if something can be regenerated and how."""
@@ -250,6 +366,9 @@ Always mention if something can be regenerated and how."""
         Returns:
             Answer string
         """
+        if not AI_ENABLED:
+            return "AI is disabled. Enable with AI_ENABLED=true in .env file."
+
         response = self._query_corey(question)
 
         if response:
